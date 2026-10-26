@@ -2,16 +2,9 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-http.createServer((req, res) => {
-  const targetUrl = decodeURIComponent(req.url.slice(1));
-  if (!targetUrl || !targetUrl.startsWith('http')) {
-    res.writeHead(400); res.end('Pas d\'URL'); return;
-  }
+const PORT = process.env.PORT || 8080;
 
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
+function fetchUrl(targetUrl, res, proxyBase) {
   const target = new URL(targetUrl);
   const lib = target.protocol === 'https:' ? https : http;
 
@@ -22,19 +15,53 @@ http.createServer((req, res) => {
     method: 'GET',
     headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' }
   }, r => {
-    // Force le Content-Type HLS pour que le navigateur ne télécharge pas
     const ct = r.headers['content-type'] || '';
     const isM3u = targetUrl.includes('.m3u') || ct.includes('mpegurl') || ct.includes('octet-stream');
-    const newHeaders = {
-      ...r.headers,
-      'Access-Control-Allow-Origin': '*',
-      'Content-Type': isM3u ? 'application/vnd.apple.mpegurl' : (ct || 'application/octet-stream'),
-      'Content-Disposition': 'inline',
-    };
-    delete newHeaders['content-encoding'];
-    res.writeHead(r.statusCode, newHeaders);
-    r.pipe(res);
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (isM3u) {
+      // Récupère le contenu texte et réécrit les URLs
+      let body = '';
+      r.setEncoding('utf8');
+      r.on('data', chunk => body += chunk);
+      r.on('end', () => {
+        const base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+        // Réécrit chaque ligne qui est une URL de segment
+        const rewritten = body.split('\n').map(line => {
+          line = line.trim();
+          if (!line || line.startsWith('#')) return line;
+          // Si c'est une URL absolue
+          if (line.startsWith('http')) {
+            return proxyBase + '/' + encodeURIComponent(line);
+          }
+          // Si c'est une URL relative
+          return proxyBase + '/' + encodeURIComponent(base + line);
+        }).join('\n');
+
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Access-Control-Allow-Origin': '*' });
+        res.end(rewritten);
+      });
+    } else {
+      // Segments .ts : proxy direct
+      const newHeaders = { ...r.headers, 'Access-Control-Allow-Origin': '*' };
+      delete newHeaders['content-encoding'];
+      res.writeHead(r.statusCode, newHeaders);
+      r.pipe(res);
+    }
   });
   proxy.on('error', e => { res.writeHead(502); res.end(e.message); });
   proxy.end();
-}).listen(process.env.PORT || 8080);
+}
+
+http.createServer((req, res) => {
+  const targetUrl = decodeURIComponent(req.url.slice(1));
+  if (!targetUrl || !targetUrl.startsWith('http')) {
+    res.writeHead(400); res.end('Pas d\'URL'); return;
+  }
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const proxyBase = 'https://stream-proxy-ti7f.onrender.com';
+  fetchUrl(targetUrl, res, proxyBase);
+}).listen(PORT);
